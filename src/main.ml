@@ -56,7 +56,7 @@ let apply_global_options o =
     (* ?utf8:[ `Extended | `Always | `Never | `Auto ] *)
     (* ?disp_status_line:[ `Always | `Never | `Auto ] *)
     ?answer:(some (flag o.yes))
-    ?safe_mode:(Some true)
+    ?safe_mode:(Some false)
     (* ?lock_retries:int *)
     (* ?log_dir:OpamTypes.dirname *)
     (* ?keep_log_dir:bool *)
@@ -4637,7 +4637,7 @@ type vnix_bool = [`NAnd of (vnix_bool * vnix_bool) | `NOr of (vnix_bool * vnix_b
 
 type nix_bool = [`NTrue | `NFalse | vnix_bool]
 
-type nix_expr = [`NTrue | `NFalse | `NAnd of (nix_expr * nix_expr) | `NOr of (nix_expr * nix_expr) | `NNot of nix_expr | `NImpl of (nix_expr * nix_expr) | `NVar of string | `NAp of (nix_expr * nix_expr) | `NAttr of (nix_expr * string) | `NEq of (nix_expr * nix_expr) | `NNeq of (nix_expr * nix_expr) | `NList of nix_expr list | `NStr of string | `NStrI of [`NLit of string | `NInterp of nix_expr] list]
+type nix_expr = [`NTrue | `NFalse | `NAnd of (nix_expr * nix_expr) | `NOr of (nix_expr * nix_expr) | `NNot of nix_expr | `NImpl of (nix_expr * nix_expr) | `NVar of string | `NAp of (nix_expr * nix_expr) | `NAttr of (nix_expr * string) | `NEq of (nix_expr * nix_expr) | `NNeq of (nix_expr * nix_expr) | `NList of nix_expr list | `NStr of string | `NStrI of [`NLit of string | `NInterp of nix_expr] list | `NSet of (string * nix_expr) list]
 type nix_const = [`NTrue | `NFalse | `NStr of string]
 
 type nix_pkg = {
@@ -4646,6 +4646,7 @@ type nix_pkg = {
   deps: nix_dep OpamPackage.Name.Map.t;
   conflicts: nix_dep OpamPackage.Name.Map.t;
   build: nix_expr;
+  src: nix_expr;
 }
 
 exception Unsupported of string
@@ -4731,6 +4732,7 @@ let rec resolve_ident = function
   | [],"with-test" -> nix_var "doCheck"
   | [],"with-doc" -> nix_true
   | [],"os" -> nix_str "linux"
+  | [],"os-distribution" -> nix_str "nixos"
   | ["ocaml"],"native" -> nix_not (`NAttr (nix_var "stdenv","isMips"))
   | ["ocaml"],"native-dynlink" -> nix_not (`NAttr (nix_var "stdenv","isMips"))
   | ["ocaml"],"preinstalled" -> nix_true
@@ -4860,11 +4862,18 @@ let rec pp_nix_expr_prec prec ppf nb =
   | `NStr s ->
       fprintf ppf "\"%s\"" @@ nix_escape s
   | `NStrI pieces -> fprintf ppf "\"%a\"" pp_nix_str pieces
-  | `NList pieces -> fprintf ppf "[@ @[";
+  | `NList pieces ->
+      fprintf ppf "[@ @[";
       pieces |> List.iter (fun x ->
         pp_nix_expr_prec `PList ppf x;
         fprintf ppf "@ ");
       fprintf ppf "@]]"
+  | `NSet attributes ->
+      fprintf ppf "{@ @[";
+      attributes |> List.iter (fun (k,v) ->
+        fprintf ppf "%s@ =@[@ %a@];@;" k (pp_nix_expr_prec `PImpl) v
+      );
+      fprintf ppf "@ @]}"
 and pp_nix_str ppf pieces = pieces |> List.iter
   (fun piece -> let open Format in
      match piece with
@@ -4903,10 +4912,14 @@ let pp_nix_pkg ppf nix_pkg =
         | `NTrue -> ()
         | _ -> fprintf ppf "@;assert %a;" pp_nix_expr asserted)
     else ());
-  fprintf ppf "@ stdlib.mkDerivation {@ @[";
+  fprintf ppf "@ stdlib.mkDerivation {@ @[@ ";
   fprintf ppf "buildPhase = stdenv.lib.concatMapStringsSep \"\\n\" (x: lib.concatStringsSep \" \" (stdenv.lib.concatLists x))@ ";
   pp_nix_expr ppf nix_pkg.build;
   fprintf ppf ";@ ";
+  fprintf ppf "src = ";
+  pp_nix_expr ppf nix_pkg.src;
+  fprintf ppf ";@ ";
+  fprintf ppf "@]@}";
   fprintf ppf "@.";
   ()
 
@@ -4937,23 +4950,6 @@ let nixdep_of_filtered_constraints fc =
   in
   let filtered_constraints = [go fc] in
   { is_required = true; filtered_constraints }
-
-let rec nixdeps_of_depends depends = match depends with
-  | Empty -> OpamPackage.Name.Map.empty
-  | Block _ -> raise Waat
-  | And (l, r) -> OpamPackage.Name.Map.union
-    (fun x y -> { x with filtered_constraints = x.filtered_constraints @ y.filtered_constraints })
-    (nixdeps_of_depends l)
-    (nixdeps_of_depends r)
-  | Or (l, r) -> raise @@ Wat (OpamFilter.string_of_filtered_formula l ^ " OROROR " ^ OpamFilter.string_of_filtered_formula r)
-  | Atom (name, cs) -> OpamPackage.Name.Map.singleton name @@ nixdep_of_filtered_constraints cs
-
-let rec nixdeps_of_depopts depopts = match depopts with
-  | Empty -> OpamPackage.Name.Map.empty
-  | Block _ -> raise Waat
-  | And (l, r) -> raise @@ Wat (OpamFilter.string_of_filtered_formula l ^ " ANDANDAND " ^ OpamFilter.string_of_filtered_formula r)
-  | Or (l, r) -> OpamPackage.Name.Map.union (fun x _ -> x) (nixdeps_of_depopts l) (nixdeps_of_depopts r)
-  | Atom (name, cs) -> OpamPackage.Name.Map.singleton name @@ { (nixdep_of_filtered_constraints cs) with is_required = false }
 
 exception Unclosed_variable_replacement of string
 
@@ -4989,39 +4985,137 @@ let nix_expand_string s = let f = function
   | `Text t -> nix_str (shell_escape t)
   in
   List.fold_right (fun x -> nix_strp (f x)) (Re.split_full string_interp_regex s) (nix_str "")
+
 let nix_expr_of_arg = function
   | CString s -> nix_list [nix_expand_string s]
   | CIdent v -> nix_list [resolve_ident @@ parse_ident v]
 
+let nix_optionals_opt b l = match b with
+  | `NTrue -> Some l
+  | `NFalse -> None
+  | cond -> Some (`NAp (`NAp (`NAttr (`NAttr (`NVar "stdenv", "lib"), "optionals"), cond), l))
+
 let nix_expr_of_args args = `NList (
   args |> OpamStd.List.filter_map (fun (arg, flt) ->
-    match OpamStd.Option.map_default nix_bool_of_filter `NTrue flt with
-    | `NTrue -> Some (nix_expr_of_arg arg)
-    | `NFalse -> None
-    | cond -> Some (`NAp (`NAp (`NAttr (`NAttr (`NVar "stdenv", "lib"), "optionals"), cond), nix_expr_of_arg arg))))
+    nix_optionals_opt
+      (OpamStd.Option.map_default nix_bool_of_filter `NTrue flt)
+      (nix_expr_of_arg arg)))
 
 let nix_expr_of_commands cmds = `NList (
   cmds |> OpamStd.List.filter_map (fun (args, flt) ->
-    match OpamStd.Option.map_default nix_bool_of_filter `NTrue flt with
-    | `NTrue -> Some (nix_expr_of_args args)
-    | `NFalse -> None
-    | cond -> Some (`NAp (`NAp (`NAttr (`NAttr (`NVar "stdenv", "lib"), "optionals"), cond), nix_expr_of_args args))))
+    nix_optionals_opt
+      (OpamStd.Option.map_default nix_bool_of_filter `NTrue flt)
+      (nix_expr_of_args args)))
+
+let rec nixdeps_of_depends depends = match depends with
+  | Empty -> OpamPackage.Name.Map.empty
+  | Block _ -> raise Waat
+  | And (l, r) -> OpamPackage.Name.Map.union
+    (fun x y -> { x with filtered_constraints = x.filtered_constraints @ y.filtered_constraints })
+    (nixdeps_of_depends l)
+    (nixdeps_of_depends r)
+  | Or (l, r) -> raise @@ Wat (OpamFilter.string_of_filtered_formula l ^ " OROROR " ^ OpamFilter.string_of_filtered_formula r)
+  | Atom (name, cs) -> OpamPackage.Name.Map.singleton name @@ nixdep_of_filtered_constraints cs
+
+let rec nixdeps_of_depopts depopts = match depopts with
+  | Empty -> OpamPackage.Name.Map.empty
+  | Block _ -> raise Waat
+  | And (l, r) -> raise @@ Wat (OpamFilter.string_of_filtered_formula l ^ " ANDANDAND " ^ OpamFilter.string_of_filtered_formula r)
+  | Or (l, r) -> OpamPackage.Name.Map.union (fun x _ -> x) (nixdeps_of_depopts l) (nixdeps_of_depopts r)
+  | Atom (name, cs) -> OpamPackage.Name.Map.singleton name @@ { (nixdep_of_filtered_constraints cs) with is_required = false }
+
+let rec nixdeps_of_depexts depexts =
+  depexts |> List.map (fun (pkgs, flt) ->
+    nix_optionals_opt
+      (nix_bool_of_filter flt)
+      (nix_list @@ List.map nix_str pkgs)
+    |> function
+      | None -> []
+      | Some (`NList xs) -> xs |> List.map (function | `NStr name -> OpamPackage.Name.Map.singleton (OpamPackage.Name.of_string name) { is_required = true; filtered_constraints = [] })
+      | Some _ -> raise @@ Wat "depext constraint too complex")
+  |> List.concat
+  |> OpamPackage.Name.Map.(List.fold_left (union (fun x y -> x)) empty)
+
+(* TODO: this *)
+let active_caches _st _nv = []
+
+let nix_src_of_opam name version opam =
+  OpamGlobalState.with_ `Lock_write @@ fun gt ->
+  OpamSwitchState.with_ `Lock_write gt @@ fun st ->
+  let open OpamProcess.Job.Op in
+  let nv = OpamPackage.create name version in
+  let cache_dir = OpamRepositoryPath.download_cache st.switch_global.root in
+  let cache_urls = active_caches st nv in
+
+  let fetch_source_job =
+    match OpamFile.OPAM.url opam with
+    | None   -> Done (Ok None)
+    | Some u ->
+      OpamRepository.pull_file_to_cache (OpamPackage.to_string nv)
+        ~cache_dir ~cache_urls
+        (OpamFile.URL.checksum u)
+        (OpamFile.URL.url u :: OpamFile.URL.mirrors u)
+      @@| function
+        | Not_available (_,na) -> Error na
+        | _ -> Ok (Some (OpamFile.URL.url u, None, OpamRepository.cache_file cache_dir (List.hd (OpamFile.URL.checksum u))))
+
+  in
+  let fetch_extra_source_job (name, u) =
+    OpamRepository.pull_file_to_cache
+      (OpamPackage.to_string nv ^"/"^ OpamFilename.Base.to_string name)
+      ~cache_dir ~cache_urls
+      (OpamFile.URL.checksum u)
+      (OpamFile.URL.url u :: OpamFile.URL.mirrors u)
+    @@| function
+      | Not_available (_,na) -> Error na
+      | _ -> Ok (Some (OpamFile.URL.url u, Some name, OpamRepository.cache_file cache_dir (List.hd (OpamFile.URL.checksum u))))
+  in
+  let result_map f = function
+    | Ok x -> Ok (f x)
+    | Error e -> Error e
+  in
+  let result_ap = function
+    | Ok f -> result_map f
+    | Error e -> fun _ -> Error e
+  in
+  let jobs = fetch_source_job :: List.map fetch_extra_source_job (OpamFile.OPAM.extra_sources opam) in
+  let jobs = jobs |> List.map (fun dl ->
+    function
+      | Error e -> Done (Error e)
+      | Ok rs -> dl @@+ (function
+        | Error e -> Done (Error e)
+        | Ok None -> Done (Ok rs)
+        | Ok (Some (url, name, file)) ->
+          OpamProcess.command ~stdout:"hash" "nix-hash" ["--type"; "sha256"; "--base32"; "--flat"; OpamFilename.to_string file] @@> (fun result ->
+            if OpamProcess.is_success result then
+              let fetch = `NSet ["url", `NStr (OpamUrl.to_string url); "sha256", `NStr (List.hd @@ result.r_stdout)] in
+              match name with
+              | None -> Done (Ok (fun (_, xs) -> rs @@ (fetch, xs)))
+              | Some name -> Done (Ok (fun (src, xs) -> rs @@ (src, (name, fetch) :: xs)))
+            else
+              Done (Error "SHA256 computation failed"))))
+  in
+  let blankSrc = `NStr "/var/empty" in
+  let r = OpamProcess.Job.run @@ OpamProcess.Job.seq jobs (Ok (fun xs -> xs))
+  in match r with
+    | Error e -> raise @@ Wat e
+    | Ok srcs -> srcs (blankSrc, [])
+
+let union_of_nixdeps =
+  OpamPackage.Name.Map.union
+    (fun d1 d2 ->
+      { is_required = d1.is_required || d2.is_required ; filtered_constraints = d1.filtered_constraints @ d2.filtered_constraints })
 
 let nix_of_opam ?name ?version opam =
   let name = match name with
   | Some x -> x
-  | None ->  OpamFile.OPAM.name opam in
+  | None -> OpamFile.OPAM.name opam in
   let version = match version with
   | Some x -> x
   | None -> OpamFile.OPAM.version opam in
   let deps = nixdeps_of_depends opam.depends in
   let depopts = nixdeps_of_depopts opam.depopts in
-  let deps = OpamPackage.Name.Map.union
-    (fun d1 d2 ->
-      { is_required = d1.is_required || d2.is_required ; filtered_constraints = d1.filtered_constraints @ d2.filtered_constraints })
-    deps
-    depopts
-  in
+  let deps = union_of_nixdeps deps depopts in
   let conflicts = nixdeps_of_depopts opam.conflicts in
   (* TODO handle conflict_class *)
   (* TODO handle available *)
@@ -5039,6 +5133,8 @@ let nix_of_opam ?name ?version opam =
   (* TODO handle messages *)
   (* TODO handle post_messages *)
   (* TODO handle depexts *)
+  let depexts = nixdeps_of_depexts opam.depexts in
+  let deps = union_of_nixdeps deps depexts in
   (* TODO handle libraries *)
   (* TODO handle syntax *)
   (* TODO handle dev_repo *)
@@ -5049,11 +5145,11 @@ let nix_of_opam ?name ?version opam =
   (* TODO handle homepage *)
   (* TODO handle doc *)
   (* TODO handle bug_reports *)
-  (* TODO handle extenstions *)
-  (* TODO handle url *)
+  (* TODO handle extensions *)
+  let (src, extra_files) = nix_src_of_opam name version opam in
   (* TODO handle descr *)
   (* TODO handle metadata_dir *)
-  { pname = name; version; deps; conflicts; build }
+  { pname = name; version; deps; conflicts; build; src }
 
 exception Done of nix_pkg
 
