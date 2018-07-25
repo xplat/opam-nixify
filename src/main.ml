@@ -4892,7 +4892,7 @@ let pp_nix_pkg ppf nix_pkg =
     pp_print_text ppf (OpamPackage.Name.to_string name) ;
     if not d.is_required then pp_print_text ppf " ? null" else ()
   in
-  pp_print_list ~pp_sep:(fun ppf _ -> fprintf ppf ",@ ") pp_arg ppf ([OpamPackage.Name.of_string "stdenv", {is_required = true; filtered_constraints = []}] @ OpamPackage.Name.Map.bindings nix_pkg.deps) ;
+  pp_print_list ~pp_sep:(fun ppf _ -> fprintf ppf ",@ ") pp_arg ppf ([OpamPackage.Name.of_string "stdenv", {is_required = true; filtered_constraints = []}; OpamPackage.Name.of_string "opam", {is_required = true; filtered_constraints = []}] @ OpamPackage.Name.Map.bindings nix_pkg.deps) ;
   fprintf ppf "@ @]}:@]";
   nix_pkg.deps |> OpamPackage.Name.Map.iter (fun name { is_required; filtered_constraints } ->
     filtered_constraints |> List.iter (fun (filters, constraints) ->
@@ -4912,12 +4912,27 @@ let pp_nix_pkg ppf nix_pkg =
         | `NTrue -> ()
         | _ -> fprintf ppf "@;assert %a;" pp_nix_expr asserted)
     else ());
-  fprintf ppf "@ stdlib.mkDerivation {@ @[@ ";
-  fprintf ppf "buildPhase = stdenv.lib.concatMapStringsSep \"\\n\" (x: lib.concatStringsSep \" \" (stdenv.lib.concatLists x))@ ";
-  pp_nix_expr ppf nix_pkg.build;
+  fprintf ppf "@ stdlib.mkDerivation rec {@ @[@ ";
+  fprintf ppf "pname = ";
+  pp_nix_expr ppf (nix_str (OpamPackage.Name.to_string nix_pkg.pname));
+  fprintf ppf ";@ ";
+  fprintf ppf "version = ";
+  pp_nix_expr ppf (nix_str (OpamPackage.Version.to_string nix_pkg.version));
+  fprintf ppf ";@ ";
+  fprintf ppf "name = \"${pname}-${version}\"";
   fprintf ppf ";@ ";
   fprintf ppf "src = ";
   pp_nix_expr ppf nix_pkg.src;
+  fprintf ppf ";@ ";
+  fprintf ppf "buildInputs = ";
+  pp_nix_expr ppf @@ nix_list (List.map (fun p -> nix_var @@ OpamPackage.Name.to_string p) (OpamPackage.Name.Map.keys nix_pkg.deps));
+  fprintf ppf ";@ ";
+  fprintf ppf "buildPhase = stdenv.lib.concatMapStringsSep \"\\n\" (x: lib.concatStringsSep \" \" (stdenv.lib.concatLists x))@ ";
+  pp_nix_expr ppf nix_pkg.build;
+  fprintf ppf ";@ ";
+  fprintf ppf "installPhase = \"${opam.installer}/bin/opam-installer -i --prefix=$out --libdir=$OCAMLFIND_DESTDIR\"";
+  fprintf ppf ";@ ";
+  fprintf ppf "createFindLibDestdir = true";
   fprintf ppf ";@ ";
   fprintf ppf "@]@}";
   fprintf ppf "@.";
@@ -5086,7 +5101,9 @@ let nix_src_of_opam name version opam =
         | Error e -> Done (Error e)
         | Ok None -> Done (Ok rs)
         | Ok (Some (url, name, file)) ->
-          OpamProcess.command ~stdout:"hash" "nix-hash" ["--type"; "sha256"; "--base32"; "--flat"; OpamFilename.to_string file] @@> (fun result ->
+          OpamSystem.make_command "nix-hash" ["--type"; "sha256"; "--base32"; "--flat"; OpamFilename.to_string file] @@> (fun result ->
+            Printf.printf "%s\n" (List.hd result.r_cleanup);
+            OpamProcess.cleanup ~force:true result;
             if OpamProcess.is_success result then
               let fetch = `NSet ["url", `NStr (OpamUrl.to_string url); "sha256", `NStr (List.hd @@ result.r_stdout)] in
               match name with

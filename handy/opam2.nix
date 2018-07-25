@@ -86,6 +86,9 @@ in stdenv.mkDerivation rec {
   # Dirty, but apparently ocp-build requires a TERM
   makeFlags = ["TERM=screen"];
 
+  outputs = [ "out" "installer" ];
+  setOutputFlags = false;
+
   # change argv0 to "opam" as a workaround for
   # https://github.com/ocaml/opam/issues/2142
   postInstall = ''
@@ -93,6 +96,7 @@ in stdenv.mkDerivation rec {
     makeWrapper $out/bin/.opam-wrapped $out/bin/opam \
       --argv0 "opam" \
       --suffix PATH : ${aspcud}/bin
+    $out/bin/opam-installer --prefix=$installer opam-installer.install
   '';
 
   doCheck = false;
